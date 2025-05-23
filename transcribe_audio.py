@@ -1,14 +1,14 @@
+import logging
 import os
 import re
-import unicodedata
-import logging
 from pathlib import Path
 
-import whisper
+import colorlog
 import torch
+import unicodedata
+import whisper
 from transformers import pipeline
 from yt_dlp import YoutubeDL
-import colorlog
 
 # Configuração do colorlog
 handler = colorlog.StreamHandler()
@@ -156,15 +156,39 @@ class AudioTranscriber:
             logger.debug("Error details:", exc_info=True)
             return None
 
+    def get_youtube_title(self, url):
+        """
+        Gets the title of a YouTube video without downloading it.
+
+        Args:
+            url: YouTube video URL
+
+        Returns:
+            The video title or None if it fails.
+        """
+        ydl_opts = {
+            'quiet': True,
+            'extract_flat': True,  # Don't extract all information
+            'skip_download': True,  # Don't download
+        }
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if 'entries' in info:
+                    info = info['entries'][0]
+                return info.get('title', None)
+        except Exception as e:
+            logger.error(f"Failed to extract video title: {str(e)}")
+            return None
+
     def transcribe_youtube(self, url, audio_format='mp3', audio_quality='192'):
         audio_file = self.download_youtube_audio(url, format=audio_format, quality=audio_quality)
         if not audio_file:
             logger.error("Could not download YouTube audio. Transcription aborted.")
             return [], None
-        transcription = self.transcribe(audio_file)
-        # Retorna a transcrição e o nome base do arquivo (sem extensão)
+        without_timestamps = self.transcribe(audio_file)
         base_filename = Path(audio_file).stem
-        return transcription, base_filename
+        return without_timestamps, base_filename
 
     def transcribe(self, file_path):
         if self.model is None:
@@ -176,26 +200,29 @@ class AudioTranscriber:
             text = result["text"]
             formatted_text = self.format_text(text)
             paragraphs = self.split_into_paragraphs(formatted_text)
-            final_text = []
+            with_timestamps = []
+            without_timestamps = []
             if "segments" in result:
                 for segment in result["segments"]:
                     time = segment.get("start", 0)
                     minutes = int(time // 60)
                     seconds = int(time % 60)
                     segment_text = self.format_text(segment["text"])
-                    final_text.append(f"[{minutes:02d}:{seconds:02d}] {segment_text}")
+                    with_timestamps.append(f"[{minutes:02d}:{seconds:02d}] {segment_text}")
+                    without_timestamps.append(segment_text)
             else:
-                final_text = paragraphs
+                with_timestamps = paragraphs
+                without_timestamps = paragraphs
             file_name = Path(file_path).stem
             out_path = os.path.join(self.output_dir, f"{file_name}_transcription.txt")
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(f"Transcription of file: {file_name}\n")
                 f.write("=" * 50 + "\n\n")
-                f.write("\n\n".join(final_text))
+                f.write("\n\n".join(with_timestamps))
                 f.write("\n\n" + "=" * 50 + "\n")
                 f.write(f"End of transcription - Model used: {self.model_size}")
             logger.info(f"Transcription saved to: {out_path}")
-            return final_text
+            return without_timestamps  # Retorna apenas a versão sem tempos
         except Exception as e:
             logger.error(f"Error during transcription: {str(e)}")
             return []
@@ -273,38 +300,77 @@ if __name__ == "__main__":
     output_dir = "transcriptions"
     transcriber = AudioTranscriber(model_size="medium", language=language, output_dir=output_dir)
 
-    # Exemplo com arquivo local:
-    # audio_path = "/path/to/your/audio.mp3"
-    # transcription = transcriber.transcribe(audio_path)
-
-    # Exemplo com YouTube:
     youtube_url = "https://www.youtube.com/watch?v=2X2SO3Y-af8"
-    transcription, base_filename = transcriber.transcribe_youtube(youtube_url)
 
-    if transcription:
-        transcriber.display_transcription(transcription)
-        complete_text = " ".join([re.sub(r'\[\d{2}:\d{2}\]\s*', '', t) for t in transcription])
-        logger.info("Generating summary...")
-        summarizer = TextSummarizer()
-        summary = summarizer.summarize(complete_text)
-        print("\nSummary of transcribed text:")
-        print("=" * 50)
-        print(summary)
-        print("=" * 50)
-        # Salva a transcrição
-        transcription_path = os.path.join(transcriber.output_dir, f"{base_filename}_transcription.txt")
-        with open(transcription_path, "w", encoding="utf-8") as f:
-            f.write("Transcription\n")
-            f.write("=" * 50 + "\n\n")
-            f.write("\n\n".join(transcription))
-        # Salva o sumário
-        summary_path = os.path.join(transcriber.output_dir, f"{base_filename}_summary.txt")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("Summary of transcription\n")
-            f.write("=" * 50 + "\n\n")
-            f.write(summary)
-        logger.info(f"Transcription saved to: {transcription_path}")
-        logger.info(f"Summary saved to: {summary_path}")
-        logger.info("Process completed successfully!")
+    # 1. Obtenha o título do vídeo para gerar o nome base dos arquivos
+    video_title = transcriber.get_youtube_title(youtube_url)
+    if not video_title:
+        logger.error("Could not get video title. Aborting.")
+        exit(1)
+    base_filename = transcriber.normalize_filename(video_title)
+
+    # 2. Defina os caminhos dos arquivos
+    transcription_with_times_path = os.path.join(transcriber.output_dir, f"{base_filename}_transcription.txt")
+    transcription_without_times_path = os.path.join(transcriber.output_dir,
+                                                    f"{base_filename}_transcription_without_times.txt")
+    summary_path = os.path.join(transcriber.output_dir, f"{base_filename}_summary.txt")
+
+    # 3. Verifique se a transcrição sem tempos já existe
+    if os.path.exists(transcription_without_times_path):
+        logger.info(f"Transcription file already exists: {transcription_without_times_path}. Skipping transcription.")
+        with open(transcription_without_times_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            without_timestamps = [line.strip() for line in lines if
+                                  line.strip() and not line.startswith("Transcription")]
     else:
-        logger.error("No transcription was generated.")
+        # 4. Se não existe, faça a transcrição e salve a versão sem tempos
+        without_timestamps, base_filename = transcriber.transcribe_youtube(youtube_url)
+        if without_timestamps:
+            with open(transcription_without_times_path, "w", encoding="utf-8") as f:
+                f.write("Transcription without timestamps\n")
+                f.write("=" * 50 + "\n\n")
+                f.write("\n\n".join(without_timestamps))
+            logger.info(f"Transcription without timestamps saved to: {transcription_without_times_path}")
+        else:
+            logger.error("No transcription was generated.")
+            exit(1)
+
+    # 5. Sumarização usando a versão sem tempos
+    complete_text = " ".join(without_timestamps)
+    logger.info(f"Text length for summarization: {len(complete_text)}")
+
+
+    # Função para escolher o modelo de sumarização
+    def get_summarizer_for_text(text):
+        if len(text) < 3500:
+            model_name = "facebook/bart-large-cnn"
+        else:
+            model_name = "facebook/led-base-16384"
+        logger.info(f"Using summarization model: {model_name}")
+        return TextSummarizer(model_name=model_name)
+
+
+    summarizer = get_summarizer_for_text(complete_text)
+    min_chars = 100
+    max_chars = 15000  # LED suporta textos bem maiores
+
+    if not complete_text or len(complete_text.strip()) < min_chars:
+        summary = "Texto muito curto para gerar um resumo."
+        logger.warning("Texto muito curto para gerar um resumo.")
+    else:
+        if len(complete_text) > max_chars:
+            logger.info(f"Texto muito grande para sumarização, cortando para {max_chars} caracteres.")
+            complete_text = complete_text[:max_chars]
+        try:
+            summary = summarizer.summarize(complete_text)
+        except Exception as e:
+            logger.error(f"Exception during summary generation: {str(e)}")
+            summary = "Unable to generate summary due to an error."
+
+    # 6. Salva o sumário
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("Summary of transcription\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(summary)
+    logger.info(f"Summary saved to: {summary_path}")
+    logger.info("Process completed successfully!")
