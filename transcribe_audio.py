@@ -64,6 +64,7 @@ class AudioTranscriber:
     def download_youtube_audio(self, url, format='mp3', quality='192'):
         """
         Downloads audio from a YouTube video using ID for filename and then renames to normalized title.
+        If the file already exists, skips download.
 
         Args:
             url: YouTube video URL
@@ -75,7 +76,44 @@ class AudioTranscriber:
         """
         logger.info(f"Downloading audio from YouTube: {url}")
 
-        # Use video ID for initial download to avoid any character issues
+        # First, get video info to determine the ID and title
+        ydl_info_opts = {
+            'quiet': True,
+            'skip_download': True,
+        }
+        try:
+            with YoutubeDL(ydl_info_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if 'entries' in info:
+                    info = info['entries'][0]
+                video_id = info.get('id', 'unknown_id')
+                video_title = info.get('title', 'unknown_video')
+        except Exception as e:
+            logger.error(f"Failed to extract video info: {str(e)}")
+            return None
+
+        # Build the expected file path
+        temp_file = os.path.join(self.download_dir, f"{video_id}.{format}")
+        normalized_title = self.normalize_filename(video_title)
+        final_file = os.path.join(self.download_dir, f"{normalized_title}.{format}")
+
+        # Check if the normalized file already exists
+        if os.path.exists(final_file):
+            logger.info(f"File already exists: {final_file}. Skipping download.")
+            return final_file
+
+        # Check if the temp file (by ID) already exists
+        if os.path.exists(temp_file):
+            logger.info(f"File already exists: {temp_file}. Renaming to normalized title.")
+            try:
+                os.rename(temp_file, final_file)
+                logger.info(f"File renamed from {temp_file} to {final_file}")
+            except Exception as e:
+                logger.error(f"Error renaming file: {str(e)}")
+                final_file = temp_file
+            return final_file
+
+        # If not, proceed to download
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -96,62 +134,22 @@ class AudioTranscriber:
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                # First extract video information
-                info = ydl.extract_info(url, download=False)
-
-                # Check if it's a playlist and get the first item if it is
-                if 'entries' in info:
-                    logger.warning("URL contains multiple videos. Using the first one.")
-                    info = info['entries'][0]
-
-                video_id = info.get('id', 'unknown_id')
-                video_title = info.get('title', 'unknown_video')
-                duration = info.get('duration', 0)  # Duration in seconds
-
                 logger.info(f"Starting download: {video_title}")
-                logger.info(f"Video ID: {video_id}")
-                logger.info(f"Duration: {duration // 60}:{duration % 60:02d}")
-
-                # Perform the download using the ID
                 ydl.download([url])
 
-                # Path to the downloaded file (using ID)
-                temp_file = os.path.join(self.download_dir, f"{video_id}.{format}")
-
-                # Check if the file exists
-                if not os.path.exists(temp_file):
-                    logger.warning(f"File with ID {video_id}.{format} not found. Looking for alternatives...")
-
-                    # Look for any recently created file with the correct format
-                    import time
-                    current_time = time.time()
-                    recent_files = [f for f in os.listdir(self.download_dir)
-                                    if f.endswith(f'.{format}') and
-                                    os.path.getmtime(os.path.join(self.download_dir, f)) >
-                                    (current_time - 60)]  # Files created in the last minute
-
-                    if recent_files:
-                        temp_file = os.path.join(self.download_dir, recent_files[0])
-                        logger.info(f"Found alternative file: {temp_file}")
-                    else:
-                        logger.error(f"Could not find downloaded file")
-                        return None
-
-                # Create normalized title for the final filename
-                normalized_title = self.normalize_filename(video_title)
-                final_file = os.path.join(self.download_dir, f"{normalized_title}.{format}")
-
-                # Rename the file
+            # After download, rename to normalized title
+            if os.path.exists(temp_file):
                 try:
                     os.rename(temp_file, final_file)
                     logger.info(f"File renamed from {temp_file} to {final_file}")
                 except Exception as e:
                     logger.error(f"Error renaming file: {str(e)}")
-                    # If rename fails, use the original file
                     final_file = temp_file
-
                 logger.info(f"Download completed: {final_file}")
                 return final_file
+            else:
+                logger.error(f"Downloaded file not found: {temp_file}")
+                return None
 
         except Exception as e:
             logger.error(f"Failed to download video: {str(e)}")
@@ -162,8 +160,11 @@ class AudioTranscriber:
         audio_file = self.download_youtube_audio(url, format=audio_format, quality=audio_quality)
         if not audio_file:
             logger.error("Could not download YouTube audio. Transcription aborted.")
-            return []
-        return self.transcribe(audio_file)
+            return [], None
+        transcription = self.transcribe(audio_file)
+        # Retorna a transcrição e o nome base do arquivo (sem extensão)
+        base_filename = Path(audio_file).stem
+        return transcription, base_filename
 
     def transcribe(self, file_path):
         if self.model is None:
@@ -278,7 +279,7 @@ if __name__ == "__main__":
 
     # Exemplo com YouTube:
     youtube_url = "https://www.youtube.com/watch?v=2X2SO3Y-af8"
-    transcription = transcriber.transcribe_youtube(youtube_url)
+    transcription, base_filename = transcriber.transcribe_youtube(youtube_url)
 
     if transcription:
         transcriber.display_transcription(transcription)
@@ -290,13 +291,19 @@ if __name__ == "__main__":
         print("=" * 50)
         print(summary)
         print("=" * 50)
-        # Normaliza o nome do arquivo para o resumo
-        file_name = Path(transcriber.download_dir).joinpath(Path(youtube_url).stem)
-        summary_path = f"{file_name}_summary.txt"
+        # Salva a transcrição
+        transcription_path = os.path.join(transcriber.output_dir, f"{base_filename}_transcription.txt")
+        with open(transcription_path, "w", encoding="utf-8") as f:
+            f.write("Transcription\n")
+            f.write("=" * 50 + "\n\n")
+            f.write("\n\n".join(transcription))
+        # Salva o sumário
+        summary_path = os.path.join(transcriber.output_dir, f"{base_filename}_summary.txt")
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("Summary of transcription\n")
             f.write("=" * 50 + "\n\n")
             f.write(summary)
+        logger.info(f"Transcription saved to: {transcription_path}")
         logger.info(f"Summary saved to: {summary_path}")
         logger.info("Process completed successfully!")
     else:
