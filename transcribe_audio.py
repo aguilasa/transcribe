@@ -15,16 +15,17 @@ handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter(
     '%(log_color)s[%(levelname)s]%(reset)s %(message)s',
     log_colors={
-        'DEBUG':    'cyan',
-        'INFO':     'blue',
-        'WARNING':  'yellow',
-        'ERROR':    'red',
+        'DEBUG': 'cyan',
+        'INFO': 'blue',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
         'CRITICAL': 'bold_red',
     }
 ))
 logger = colorlog.getLogger("transcriber")
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)  # Altere para DEBUG se quiser mais detalhes
+
 
 class AudioTranscriber:
     def __init__(self, model_size="medium", language=None, download_dir="downloads", output_dir="transcriptions"):
@@ -62,7 +63,7 @@ class AudioTranscriber:
 
     def download_youtube_audio(self, url, format='mp3', quality='192'):
         """
-        Downloads audio from a YouTube video.
+        Downloads audio from a YouTube video using ID for filename and then renames to normalized title.
 
         Args:
             url: YouTube video URL
@@ -74,6 +75,7 @@ class AudioTranscriber:
         """
         logger.info(f"Downloading audio from YouTube: {url}")
 
+        # Use video ID for initial download to avoid any character issues
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -81,8 +83,8 @@ class AudioTranscriber:
                 'preferredcodec': format,
                 'preferredquality': quality,
             }],
-            'outtmpl': os.path.join(self.download_dir, '%(title)s.%(ext)s'),
-            'verbose': True,  # Mudado para True para ver mais detalhes
+            'outtmpl': os.path.join(self.download_dir, '%(id)s.%(ext)s'),
+            'verbose': True,
             'quiet': False,
             'no_warnings': False,
             'noplaylist': True,
@@ -94,60 +96,66 @@ class AudioTranscriber:
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                # Primeiro extrai as informações do vídeo
+                # First extract video information
                 info = ydl.extract_info(url, download=False)
 
-                # Verifica se é uma playlist e pega o primeiro item se for
+                # Check if it's a playlist and get the first item if it is
                 if 'entries' in info:
                     logger.warning("URL contains multiple videos. Using the first one.")
                     info = info['entries'][0]
 
+                video_id = info.get('id', 'unknown_id')
                 video_title = info.get('title', 'unknown_video')
-                duration = info.get('duration', 0)  # Duração em segundos
+                duration = info.get('duration', 0)  # Duration in seconds
 
                 logger.info(f"Starting download: {video_title}")
+                logger.info(f"Video ID: {video_id}")
                 logger.info(f"Duration: {duration // 60}:{duration % 60:02d}")
 
-                # Normaliza o título para o nome do arquivo
-                normalized_title = self.normalize_filename(video_title)
-
-                # Realiza o download - usando a URL original
+                # Perform the download using the ID
                 ydl.download([url])
 
-                # Constrói o caminho do arquivo baseado no título normalizado
-                output_file = os.path.join(self.download_dir, f"{normalized_title}.{format}")
+                # Path to the downloaded file (using ID)
+                temp_file = os.path.join(self.download_dir, f"{video_id}.{format}")
 
-                # Verifica se o arquivo existe
-                if not os.path.exists(output_file):
-                    # Tenta encontrar o arquivo com o título original
-                    original_file = os.path.join(self.download_dir, f"{video_title}.{format}")
-                    if os.path.exists(original_file):
-                        # Renomeia para o nome normalizado
-                        os.rename(original_file, output_file)
-                        logger.info(f"File renamed to: {output_file}")
+                # Check if the file exists
+                if not os.path.exists(temp_file):
+                    logger.warning(f"File with ID {video_id}.{format} not found. Looking for alternatives...")
+
+                    # Look for any recently created file with the correct format
+                    import time
+                    current_time = time.time()
+                    recent_files = [f for f in os.listdir(self.download_dir)
+                                    if f.endswith(f'.{format}') and
+                                    os.path.getmtime(os.path.join(self.download_dir, f)) >
+                                    (current_time - 60)]  # Files created in the last minute
+
+                    if recent_files:
+                        temp_file = os.path.join(self.download_dir, recent_files[0])
+                        logger.info(f"Found alternative file: {temp_file}")
                     else:
-                        # Procura por qualquer arquivo .mp3 recém-criado
-                        mp3_files = [f for f in os.listdir(self.download_dir)
-                                     if f.endswith(f'.{format}') and
-                                     os.path.getmtime(os.path.join(self.download_dir, f)) >
-                                     (os.path.getmtime(__file__) - 60)]  # Arquivos criados nos últimos 60 segundos
+                        logger.error(f"Could not find downloaded file")
+                        return None
 
-                        if mp3_files:
-                            # Usa o primeiro arquivo encontrado
-                            found_file = os.path.join(self.download_dir, mp3_files[0])
-                            os.rename(found_file, output_file)
-                            logger.info(f"Found and renamed file to: {output_file}")
-                        else:
-                            logger.warning(f"Could not find the downloaded file. Using original path.")
-                            # Tenta usar o caminho que o yt-dlp deve ter usado
-                            output_file = os.path.join(self.download_dir, f"{video_title}.{format}")
+                # Create normalized title for the final filename
+                normalized_title = self.normalize_filename(video_title)
+                final_file = os.path.join(self.download_dir, f"{normalized_title}.{format}")
 
-                logger.info(f"Download completed: {output_file}")
-                return output_file
+                # Rename the file
+                try:
+                    os.rename(temp_file, final_file)
+                    logger.info(f"File renamed from {temp_file} to {final_file}")
+                except Exception as e:
+                    logger.error(f"Error renaming file: {str(e)}")
+                    # If rename fails, use the original file
+                    final_file = temp_file
+
+                logger.info(f"Download completed: {final_file}")
+                return final_file
 
         except Exception as e:
             logger.error(f"Failed to download video: {str(e)}")
-            logger.debug("Error details:", exc_info=True)  # Adiciona detalhes do erro no nível DEBUG
+            logger.debug("Error details:", exc_info=True)
             return None
 
     def transcribe_youtube(self, url, audio_format='mp3', audio_quality='192'):
@@ -223,6 +231,7 @@ class AudioTranscriber:
             print()
         print("=" * 50)
 
+
 class TextSummarizer:
     def __init__(self, model_name="facebook/bart-large-cnn"):
         logger.info(f"Loading summarization model '{model_name}' on CPU...")
@@ -252,6 +261,7 @@ class TextSummarizer:
         except Exception as e:
             logger.error(f"Error generating summary: {str(e)}")
             return "Unable to generate summary."
+
 
 if __name__ == "__main__":
     if torch.cuda.is_available():
