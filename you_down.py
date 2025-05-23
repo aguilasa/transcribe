@@ -56,7 +56,7 @@ def baixar_audio_youtube_avancado(url, formato='mp3', qualidade='192', pasta_des
         return None
 
 # Exemplo de uso
-url_video = "https://www.youtube.com/live/p95VYdLmbHY"
+url_video = "https://www.youtube.com/watch?v=2X2SO3Y-af8"
 arquivo = baixar_audio_youtube_avancado(
     url=url_video,
     formato='mp3',

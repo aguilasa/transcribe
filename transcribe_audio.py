@@ -1,48 +1,64 @@
+import os
+import re
+import unicodedata
+import logging
+from pathlib import Path
+
 import whisper
 import torch
-from pathlib import Path
-import re
 from transformers import pipeline
 from yt_dlp import YoutubeDL
-import os
+import colorlog
+
+# Configuração do colorlog
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter(
+    '%(log_color)s[%(levelname)s]%(reset)s %(message)s',
+    log_colors={
+        'DEBUG':    'cyan',
+        'INFO':     'blue',
+        'WARNING':  'yellow',
+        'ERROR':    'red',
+        'CRITICAL': 'bold_red',
+    }
+))
+logger = colorlog.getLogger("transcriber")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)  # Altere para DEBUG se quiser mais detalhes
 
 class AudioTranscriber:
     def __init__(self, model_size="medium", language=None, download_dir="downloads", output_dir="transcriptions"):
-        """
-        Initializes the transcriber with the specified Whisper model size and language.
-        If language is None, Whisper will auto-detect.
-
-        Args:
-            model_size: Size of the Whisper model ('tiny', 'base', 'small', 'medium', 'large')
-            language: Language code ('en', 'pt', etc.) or None for auto-detection
-            download_dir: Directory to save downloaded audio files
-            output_dir: Directory to save transcription files
-        """
         self.model_size = model_size
         self.language = language
         self.model = None
         self.download_dir = download_dir
         self.output_dir = output_dir
 
-        # Create download directory if it doesn't exist
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
-
-        # Create output directory if it doesn't exist
+            logger.info(f"Created download directory: {self.download_dir}")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+            logger.info(f"Created output directory: {self.output_dir}")
 
         self._load_model()
 
     def _load_model(self):
-        """Loads the Whisper model on CPU."""
-        print(f"[INFO] Loading Whisper model '{self.model_size}' on CPU...")
+        logger.info(f"Loading Whisper model '{self.model_size}' on CPU...")
         try:
             self.model = whisper.load_model(self.model_size).to("cpu")
-            print("[INFO] Model loaded successfully.")
+            logger.info("Model loaded successfully.")
         except Exception as e:
-            print(f"[ERROR] Failed to load model: {str(e)}")
+            logger.error(f"Failed to load model: {str(e)}")
             self.model = None
+
+    def normalize_filename(self, filename):
+        filename = filename.lower()
+        filename = filename.replace(" ", "-")
+        filename = re.sub(r'[^a-z0-9\-_\.]', '', filename)
+        filename = ''.join(c for c in unicodedata.normalize('NFD', filename)
+                           if unicodedata.category(c) != 'Mn')
+        return filename
 
     def download_youtube_audio(self, url, format='mp3', quality='192'):
         """
@@ -56,7 +72,7 @@ class AudioTranscriber:
         Returns:
             Path to the downloaded audio file or None if download failed
         """
-        print(f"[INFO] Downloading audio from YouTube: {url}")
+        logger.info(f"Downloading audio from YouTube: {url}")
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -66,7 +82,7 @@ class AudioTranscriber:
                 'preferredquality': quality,
             }],
             'outtmpl': os.path.join(self.download_dir, '%(title)s.%(ext)s'),
-            'verbose': False,
+            'verbose': True,  # Mudado para True para ver mais detalhes
             'quiet': False,
             'no_warnings': False,
             'noplaylist': True,
@@ -78,66 +94,79 @@ class AudioTranscriber:
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                # First extract video information
+                # Primeiro extrai as informações do vídeo
                 info = ydl.extract_info(url, download=False)
-                video_title = info['title']
-                duration = info.get('duration', 0)  # Duration in seconds
 
-                print(f"[INFO] Starting download: {video_title}")
-                print(f"[INFO] Duration: {duration//60}:{duration%60:02d}")
+                # Verifica se é uma playlist e pega o primeiro item se for
+                if 'entries' in info:
+                    logger.warning("URL contains multiple videos. Using the first one.")
+                    info = info['entries'][0]
 
-                # Perform download
+                video_title = info.get('title', 'unknown_video')
+                duration = info.get('duration', 0)  # Duração em segundos
+
+                logger.info(f"Starting download: {video_title}")
+                logger.info(f"Duration: {duration // 60}:{duration % 60:02d}")
+
+                # Normaliza o título para o nome do arquivo
+                normalized_title = self.normalize_filename(video_title)
+
+                # Realiza o download - usando a URL original
                 ydl.download([url])
 
-                # The file will have the format extension, not the original
-                output_file = os.path.join(self.download_dir, f"{video_title}.{format}")
-                print(f"[INFO] Download completed: {output_file}")
+                # Constrói o caminho do arquivo baseado no título normalizado
+                output_file = os.path.join(self.download_dir, f"{normalized_title}.{format}")
+
+                # Verifica se o arquivo existe
+                if not os.path.exists(output_file):
+                    # Tenta encontrar o arquivo com o título original
+                    original_file = os.path.join(self.download_dir, f"{video_title}.{format}")
+                    if os.path.exists(original_file):
+                        # Renomeia para o nome normalizado
+                        os.rename(original_file, output_file)
+                        logger.info(f"File renamed to: {output_file}")
+                    else:
+                        # Procura por qualquer arquivo .mp3 recém-criado
+                        mp3_files = [f for f in os.listdir(self.download_dir)
+                                     if f.endswith(f'.{format}') and
+                                     os.path.getmtime(os.path.join(self.download_dir, f)) >
+                                     (os.path.getmtime(__file__) - 60)]  # Arquivos criados nos últimos 60 segundos
+
+                        if mp3_files:
+                            # Usa o primeiro arquivo encontrado
+                            found_file = os.path.join(self.download_dir, mp3_files[0])
+                            os.rename(found_file, output_file)
+                            logger.info(f"Found and renamed file to: {output_file}")
+                        else:
+                            logger.warning(f"Could not find the downloaded file. Using original path.")
+                            # Tenta usar o caminho que o yt-dlp deve ter usado
+                            output_file = os.path.join(self.download_dir, f"{video_title}.{format}")
+
+                logger.info(f"Download completed: {output_file}")
                 return output_file
 
         except Exception as e:
-            print(f"[ERROR] Failed to download video: {str(e)}")
+            logger.error(f"Failed to download video: {str(e)}")
+            logger.debug("Error details:", exc_info=True)  # Adiciona detalhes do erro no nível DEBUG
             return None
 
     def transcribe_youtube(self, url, audio_format='mp3', audio_quality='192'):
-        """
-        Downloads and transcribes audio from a YouTube video.
-
-        Args:
-            url: YouTube video URL
-            audio_format: Audio format to download
-            audio_quality: Audio quality in kbps
-
-        Returns:
-            List of transcribed segments or empty list if failed
-        """
         audio_file = self.download_youtube_audio(url, format=audio_format, quality=audio_quality)
         if not audio_file:
-            print("[ERROR] Could not download YouTube audio. Transcription aborted.")
+            logger.error("Could not download YouTube audio. Transcription aborted.")
             return []
-
         return self.transcribe(audio_file)
 
     def transcribe(self, file_path):
-        """
-        Transcribes the given audio file.
-
-        Args:
-            file_path: Path to the audio file
-
-        Returns:
-            List of formatted transcription segments
-        """
         if self.model is None:
-            print("[ERROR] Model is not loaded. Cannot transcribe.")
+            logger.error("Model is not loaded. Cannot transcribe.")
             return []
-
-        print(f"[INFO] Starting transcription for: {file_path}")
+        logger.info(f"Starting transcription for: {file_path}")
         try:
             result = self.model.transcribe(file_path, language=self.language, fp16=False)
             text = result["text"]
             formatted_text = self.format_text(text)
             paragraphs = self.split_into_paragraphs(formatted_text)
-
             final_text = []
             if "segments" in result:
                 for segment in result["segments"]:
@@ -148,7 +177,6 @@ class AudioTranscriber:
                     final_text.append(f"[{minutes:02d}:{seconds:02d}] {segment_text}")
             else:
                 final_text = paragraphs
-
             file_name = Path(file_path).stem
             out_path = os.path.join(self.output_dir, f"{file_name}_transcription.txt")
             with open(out_path, "w", encoding="utf-8") as f:
@@ -157,19 +185,14 @@ class AudioTranscriber:
                 f.write("\n\n".join(final_text))
                 f.write("\n\n" + "=" * 50 + "\n")
                 f.write(f"End of transcription - Model used: {self.model_size}")
-
-            print(f"[INFO] Transcription saved to: {out_path}")
+            logger.info(f"Transcription saved to: {out_path}")
             return final_text
-
         except Exception as e:
-            print(f"[ERROR] Error during transcription: {str(e)}")
+            logger.error(f"Error during transcription: {str(e)}")
             return []
 
     @staticmethod
     def format_text(text):
-        """
-        Formats text for better readability.
-        """
         text = re.sub(r'\s+', ' ', text).strip()
         if not text.rstrip().endswith(('.', '!', '?')):
             text = text.rstrip() + '.'
@@ -179,29 +202,20 @@ class AudioTranscriber:
 
     @staticmethod
     def split_into_paragraphs(text, max_words=30):
-        """
-        Splits text into paragraphs based on a maximum number of words.
-        """
         words = text.split()
         paragraphs = []
         current_paragraph = []
-
         for word in words:
             current_paragraph.append(word)
             if (word.endswith(('.', '!', '?')) and len(current_paragraph) >= max_words):
                 paragraphs.append(' '.join(current_paragraph))
                 current_paragraph = []
-
         if current_paragraph:
             paragraphs.append(' '.join(current_paragraph))
-
         return paragraphs
 
     @staticmethod
     def display_transcription(final_text):
-        """
-        Displays the transcription in a formatted way in the console.
-        """
         print("\nTranscription:")
         print("=" * 50)
         for paragraph in final_text:
@@ -211,29 +225,22 @@ class AudioTranscriber:
 
 class TextSummarizer:
     def __init__(self, model_name="facebook/bart-large-cnn"):
-        """
-        Initializes the summarizer with the specified Hugging Face model.
-        """
-        print(f"[INFO] Loading summarization model '{model_name}' on CPU...")
+        logger.info(f"Loading summarization model '{model_name}' on CPU...")
         try:
             self.summarizer = pipeline(
                 "summarization",
                 model=model_name,
                 device="cpu"
             )
-            print("[INFO] Summarization model loaded successfully.")
+            logger.info("Summarization model loaded successfully.")
         except Exception as e:
-            print(f"[ERROR] Failed to load summarization model: {str(e)}")
+            logger.error(f"Failed to load summarization model: {str(e)}")
             self.summarizer = None
 
     def summarize(self, text, max_tokens=130, min_tokens=30):
-        """
-        Summarizes the given text.
-        """
         if self.summarizer is None:
-            print("[ERROR] Summarizer is not loaded. Cannot summarize.")
+            logger.error("Summarizer is not loaded. Cannot summarize.")
             return "Unable to generate summary."
-
         try:
             summary = self.summarizer(
                 text,
@@ -243,51 +250,44 @@ class TextSummarizer:
             )
             return summary[0]['summary_text']
         except Exception as e:
-            print(f"[ERROR] Error generating summary: {str(e)}")
+            logger.error(f"Error generating summary: {str(e)}")
             return "Unable to generate summary."
 
 if __name__ == "__main__":
-    # Clear CUDA memory if available
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print("[INFO] CUDA memory cleared.")
+        logger.info("CUDA memory cleared.")
 
-    language = None  # Set to "en" for English, "pt" for Portuguese, or None for auto-detect
-    output_dir = "transcriptions"  # Set the desired output directory for transcriptions
+    language = None
+    output_dir = "transcriptions"
     transcriber = AudioTranscriber(model_size="medium", language=language, output_dir=output_dir)
 
-    # Example usage with local file
-    # audio_path = "/path/to/your/audio.mp3"  # Replace with your local audio file
+    # Exemplo com arquivo local:
+    # audio_path = "/path/to/your/audio.mp3"
     # transcription = transcriber.transcribe(audio_path)
 
-    # Example usage with YouTube URL
-    youtube_url = "https://www.youtube.com/live/p95VYdLmbHY"
+    # Exemplo com YouTube:
+    youtube_url = "https://www.youtube.com/watch?v=2X2SO3Y-af8"
     transcription = transcriber.transcribe_youtube(youtube_url)
 
     if transcription:
         transcriber.display_transcription(transcription)
-
-        # Remove timestamps for summarization
         complete_text = " ".join([re.sub(r'\[\d{2}:\d{2}\]\s*', '', t) for t in transcription])
-
-        print("\n[INFO] Generating summary...")
+        logger.info("Generating summary...")
         summarizer = TextSummarizer()
         summary = summarizer.summarize(complete_text)
-
         print("\nSummary of transcribed text:")
         print("=" * 50)
         print(summary)
         print("=" * 50)
-
-        # Get the filename from the last transcription
+        # Normaliza o nome do arquivo para o resumo
         file_name = Path(transcriber.download_dir).joinpath(Path(youtube_url).stem)
         summary_path = f"{file_name}_summary.txt"
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("Summary of transcription\n")
             f.write("=" * 50 + "\n\n")
             f.write(summary)
-
-        print(f"\n[INFO] Summary saved to: {summary_path}")
-        print("[INFO] Process completed successfully!")
+        logger.info(f"Summary saved to: {summary_path}")
+        logger.info("Process completed successfully!")
     else:
-        print("[ERROR] No transcription was generated.")
+        logger.error("No transcription was generated.")
